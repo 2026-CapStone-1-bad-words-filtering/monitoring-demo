@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+    <meta charset="UTF-8">
+    <title>CAU-Mall 자유게시판</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            padding: 20px;
+        }
+
+        .board-container {
+            max-width: 500px;
+            margin: auto;
+            border: 1px solid #ddd;
+            padding: 20px;
+        }
+
+        textarea {
+            width: 100%;
+            height: 100px;
+            margin-bottom: 10px;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn-cancel {
+            background: #eee;
+            border: 1px solid #ccc;
+            padding: 10px;
+            cursor: pointer;
+        }
+
+        .btn-submit {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="board-container">
+        <h2>문의하기</h2>
+        <form id="write_form">
+            <input type="text" id="post_title" placeholder="제목을 입력하세요" style="width: 100%; margin-bottom: 10px;"><br>
+            <textarea id="board_content" name="content" placeholder="비속어 테스트를 해보세요 (예: 바보, 멍청이)"></textarea>
+
+            <div class="btn-group">
+                <button type="button" class="btn-cancel">취소</button>
+                <button type="button" class="btn-submit" id="main_submit_btn">등록하기</button>
+            </div>
+        </form>
+    </div>
+
+    <script src="/loader.js?site_id=cau_test_01"></script>
+</body>
+
+</html>
