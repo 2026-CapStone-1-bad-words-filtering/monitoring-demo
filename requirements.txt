@@ -1,6 +1,9 @@
 fastapi
 uvicorn
-google-generativeai
+sqlalchemy
+pymysql
 python-dotenv
 playwright
+transformers
+torch
 openai

@@ -1,65 +1,29 @@
 <!DOCTYPE html>
-<html lang="ko">
-
-<head>
-    <meta charset="UTF-8">
-    <title>CAU-Mall 자유게시판</title>
-    <style>
-        body {
-            font-family: sans-serif;
-            padding: 20px;
-        }
-
-        .board-container {
-            max-width: 500px;
-            margin: auto;
-            border: 1px solid #ddd;
-            padding: 20px;
-        }
-
-        textarea {
-            width: 100%;
-            height: 100px;
-            margin-bottom: 10px;
-        }
-
-        .btn-group {
-            display: flex;
-            gap: 10px;
-        }
-
-        .btn-cancel {
-            background: #eee;
-            border: 1px solid #ccc;
-            padding: 10px;
-            cursor: pointer;
-        }
-
-        .btn-submit {
-            background: #007bff;
-            color: white;
-            border: none;
-            padding: 10px;
-            cursor: pointer;
-        }
-    </style>
-</head>
+<html>
 
 <body>
-    <div class="board-container">
-        <h2>문의하기</h2>
-        <form id="write_form">
-            <input type="text" id="post_title" placeholder="제목을 입력하세요" style="width: 100%; margin-bottom: 10px;"><br>
-            <textarea id="board_content" name="content" placeholder="비속어 테스트를 해보세요 (예: 바보, 멍청이)"></textarea>
+    <h2>하꼬 쇼핑몰 게시판</h2>
+    <textarea id="content" placeholder="내용을 입력하세요"></textarea>
+    <button id="sendBtn">등록</button>
 
-            <div class="btn-group">
-                <button type="button" class="btn-cancel">취소</button>
-                <button type="button" class="btn-submit" id="main_submit_btn">등록하기</button>
-            </div>
-        </form>
-    </div>
+    <script>
+        document.getElementById('sendBtn').onclick = async () => {
+            const content = document.getElementById('content').value;
 
-    <script src="/loader.js?site_id=cau_test_01"></script>
+            console.log("🚀 원본 fetch 실행 시도...");
+            // 실제로는 존재하지 않는 API 주소지만, 가로채기 확인용입니다.
+            const response = await fetch('/api/v1/posts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content: content })
+            });
+
+            const result = await response.json();
+            console.log("📦 서버 응답:", result);
+        };
+    </script>
+
+    <script src="shield_agent.js"></script>
 </body>
 
 </html>
