@@ -16,7 +16,8 @@ async def start_analysis(url: str, db: Session = Depends(get_db)):
     
     # 1. 캡처 및 LLM 분석
     await worker.capture_all()
-    analysis = await worker.analyze_with_llm()
+    analysis = {}
+    # await worker.analyze_with_llm()
     
     # 2. GET 검증
     verified_get = await worker.verify_analysis(analysis.get('get_rules', []))
