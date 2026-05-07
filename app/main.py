@@ -66,7 +66,7 @@ async def start_pipeline():
     await login_and_save_session(target_url)
 
     # 3. 분석 엔진 가동 (저장된 세션 자동 로드)
-    analyzer = DebugIntegratedAnalyzer(target_url, max_pages=30)
+    analyzer = DebugIntegratedAnalyzer(target_url, max_pages=30, delay_range=(1.5, 2.5))
     results = await analyzer.run()
 
     # 4. RDS 저장
