@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: filtering_db
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: filter_system
+    ports:
+      - "3307:3306"  # 왼쪽(호스트)을 3307로 변경!
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - filtering_network
+
+  # 2. API Server: 시스템의 컨트롤 타워 (FastAPI)
+  api-server:
+    build: ./api-server
+    container_name: filtering_api
+    restart: always
+    depends_on:
+      - db
+      - analyzer
+    environment:
+      # DB 접속 정보 (서비스 이름 'db' 사용)
+      - DATABASE_URL=mysql+pymysql://root:password@db:3306/filter_system
+      # 분석기 접속 정보 (서비스 이름 'analyzer' 사용)
+      - ANALYZER_URL=http://analyzer:8000
+    ports:
+      - "8000:8000"
+    networks:
+      - filtering_network
+
+  # 3. Analyzer: Playwright 기반 웹 구조 분석기 (Worker)
+  analyzer:
+    build: ./analyzer
+    container_name: filtering_analyzer
+    restart: always
+    environment:
+      # 파이썬 로그가 버퍼링 없이 즉시 출력되도록 설정 (실시간 로그 스트리밍용)
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # 로그인 세션(JSON)을 컨테이너가 꺼져도 유지하도록 호스트와 연결
+      - ./analyzer/auth:/app/auth
+    networks:
+      - filtering_network
+
+  # 4. Inference Engine: AI 모델 추론 서버 (BERT/KoELECTRA)
+  # (아직 코드를 작성하지 않았다면 우선 skeleton 이미지로 설정 가능)
+  # inference-engine:
+  #   build: ./inference-engine
+  #   container_name: filtering_inference
+  #   restart: always
+  #   ports:
+  #     - "8080:8080"
+  #   networks:
+  #     - filtering_network
+
+networks:
+  filtering_network:
+    driver: bridge
+
+volumes:
+  mysql_data:
