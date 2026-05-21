@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from .models import Site, BoardStructure # api-server의 모델 참조
+from .models import Site, BoardStructure
 
 def save_analysis_results(db: Session, domain: str, analysis_data: dict):
     """분석된 구조 데이터를 DB에 영구 저장"""
@@ -23,13 +23,15 @@ def save_analysis_results(db: Session, domain: str, analysis_data: dict):
                 site_id=site.id,
                 mid=mid,
                 url_pattern=info.get("url_pattern"),
-                get_selectors=info.get("get_selectors"), 
+                # 🚀 DB 컬럼명은 get_selectors지만, 꺼내올 때는 "selectors"로 꺼내야 합니다!
+                get_selectors=info.get("selectors"), 
                 post_metadata=info.get("post_metadata"),
                 is_verified=True if info.get("post_metadata") else False
             )
             db.add(board)
         else:
-            board.get_selectors = info.get("get_selectors")
+            # 🚀 여기도 마찬가지로 "selectors"로 수정!
+            board.get_selectors = info.get("selectors")
             board.post_metadata = info.get("post_metadata")
             
     db.commit()
