@@ -6,7 +6,8 @@ import httpx
 import websockets
 from urllib.parse import urlparse
 import ast
-
+import httpx
+from fastapi import Request
 from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -33,6 +34,7 @@ app.add_middleware(
 
 # DB 테이블 자동 생성
 models.Base.metadata.create_all(bind=database.engine)
+INFERENCE_ENGINE_URL = "http://inference-engine:8080/detect"
 
 # DB 의존성 주입 함수
 def get_db():
@@ -192,44 +194,51 @@ async def filter_content(payload: schemas.FilterRequest):
 
 @app.get("/agent/{domain}.js")
 async def get_domain_agent(domain: str, db: Session = Depends(get_db)):
-    # 1. DB에서 사이트 조회 (도커 내부망 테스트 우회 포함)
+    # 1. DB에서 사이트 조회
     site = db.query(Site).filter(Site.domain == domain).first()
-    
-    if not site:
-        # 프론트엔드가 localhost로 요청해도, DB에 저장된 host.docker.internal을 찾도록 매핑
-        if "localhost" in domain or "127.0.0.1" in domain:
-            site = db.query(Site).filter(Site.domain.contains("host.docker.internal")).first()
-        
-        if not site:
-            raise HTTPException(status_code=404, detail=f"Site not found: {domain}")
 
-    # 2. 구조 정보 가져와서 배열 병합
-    structures = db.query(BoardStructure).filter(BoardStructure.site_id == site.id).all()
+    if not site:
+        if "localhost" in domain or "127.0.0.1" in domain:
+            site = db.query(Site).filter(
+                Site.domain.contains("host.docker.internal")
+            ).first()
+
+        if not site:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Site not found: {domain}"
+            )
+
+    # 2. 구조 정보 병합
+    structures = db.query(BoardStructure).filter(
+        BoardStructure.site_id == site.id
+    ).all()
+
     all_selectors = []
-    
+
     print(f"\n--- [에이전트 발급 디버깅: {domain}] ---")
     print(f"찾아낸 게시판 구조 개수: {len(structures)}개")
 
     for struct in structures:
-        db_selectors = struct.get_selectors 
+        db_selectors = struct.get_selectors
+
         print(f"[DEBUG] 꺼낸 데이터: {db_selectors}")
         print(f"[DEBUG] 데이터 타입: {type(db_selectors)}")
-        
+
         if db_selectors:
-            # 문자열(str)로 튀어나올 경우 강제 변환
+
             if isinstance(db_selectors, str):
                 try:
-                    # 1차 시도: 표준 JSON 파싱
                     db_selectors = json.loads(db_selectors)
+
                 except json.JSONDecodeError:
                     try:
-                        # 2차 시도: 싱글 쿼터 등 파이썬 딕셔너리 문자열 강제 파싱
                         db_selectors = ast.literal_eval(db_selectors)
+
                     except Exception as e:
-                        print(f"[DB_PARSE_ERROR] 변환 완전 실패 ({struct.mid}): {e}")
+                        print(f"[DB_PARSE_ERROR] 변환 실패 ({struct.mid}): {e}")
                         continue
-                        
-            # 리스트면 통째로 합치고, 딕셔너리면 리스트 안에 넣기
+
             if isinstance(db_selectors, list):
                 all_selectors.extend(db_selectors)
             else:
@@ -239,168 +248,324 @@ async def get_domain_agent(domain: str, db: Session = Depends(get_db)):
 
     js_selectors_payload = dumps(all_selectors, ensure_ascii=False)
 
-    # 3. [연동 전용] 텍스트 필터링/수정 스크립트 템플릿
-    # 3. [연동 전용] 텍스트 필터링/수정 및 패킷 차단 스크립트 템플릿
+    # ==========================================
+    # JS SDK 생성
+    # ==========================================
+
     js_template = f"""
     (function() {{
         'use strict';
-        console.log("[SDK][INIT] '{site.site_name}' 에이전트 활성화 (도메인: {domain})");
-        
+
+        console.log("[SDK][INIT] '{site.site_name}' 에이전트 활성화");
+        console.log("[SDK][INIT] 필터 API: /api/detect");
+
+        const targetSelectors = {js_selectors_payload};
+
         // ==========================================
-        // 🚨 [네트워크 검문소] POST 요청 가로채기 (fetch & XHR)
-        // ==========================================
-        const BAD_WORD = "시발";
-
-        // 1. Fetch API 가로채기 (최신 React/Next.js 주력 통신)
-        const originalFetch = window.fetch;
-        window.fetch = async function(...args) {{
-            const [resource, config] = args;
-            
-            if (config && config.method && config.method.toUpperCase() === 'POST' && config.body) {{
-                let bodyText = "";
-                
-                if (typeof config.body === 'string') {{
-                    bodyText = config.body;
-                }} else if (config.body instanceof FormData) {{
-                    for (let [key, value] of config.body.entries()) {{
-                        bodyText += value + " ";
-                    }}
-                }}
-
-                if (bodyText.includes(BAD_WORD)) {{
-                    console.error(`[SDK][🚫 차단] fetch POST 요청에 금칙어('${{BAD_WORD}}')가 감지되어 전송을 차단합니다.`);
-                    alert("⚠️ 금칙어가 포함되어 글을 등록할 수 없습니다.");
-                    // 서버로 패킷을 보내지 않고 프론트엔드 단에서 에러로 터뜨림
-                    return Promise.reject(new Error("욕설 필터링에 의해 요청이 차단되었습니다."));
-                }}
-            }}
-            return originalFetch.apply(this, args);
-        }};
-
-        // 2. XMLHttpRequest (XHR) 가로채기 (구형 라이브러리 및 AJAX 대응)
-        const originalXHRSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.send = function(body) {{
-            if (body) {{
-                let bodyText = "";
-                
-                if (typeof body === 'string') {{
-                    bodyText = body;
-                }} else if (body instanceof FormData) {{
-                    for (let [key, value] of body.entries()) {{
-                        bodyText += value + " ";
-                    }}
-                }}
-
-                if (bodyText.includes(BAD_WORD)) {{
-                    console.error(`[SDK][🚫 차단] XHR POST 요청에 금칙어('${{BAD_WORD}}')가 감지되어 전송을 차단합니다.`);
-                    alert("⚠️ 금칙어가 포함되어 글을 등록할 수 없습니다.");
-                    this.abort(); // 통신 강제 취소
-                    return; 
-                }}
-            }}
-            originalXHRSend.apply(this, arguments);
-        }};
+        // 성능 설정
         // ==========================================
 
-        const targetSelectors = {js_selectors_payload}; 
-        console.log("[SDK][INIT] DB에서 가져온 쿼리 총 개수:", targetSelectors.length, "개");
-        
+        const SCAN_DELAY = 300;
+        const textCache = new Map();
+
+        // ==========================================
+        // 셀렉터 조합
+        // ==========================================
+
         function buildQuery(selectorObj) {{
             if (!selectorObj || !selectorObj.tag) return null;
+
             let query = selectorObj.tag;
+
             if (selectorObj.className) {{
-                const classes = selectorObj.className.split(' ').filter(c => c).join('.');
-                if (classes) query += `.${{classes}}`;
+                const classes = selectorObj.className
+                    .split(' ')
+                    .filter(c => c)
+                    .join('.');
+
+                if (classes) {{
+                    query += `.${{classes}}`;
+                }}
             }}
+
             return query;
         }}
 
-        function checkAndFilter(triggerSource) {{
-            let activeMatchCount = 0;
-            
-            targetSelectors.forEach(sel => {{
-                const query = buildQuery(sel);
-                if (!query) return;
+        // ==========================================
+        // AI 검사 함수
+        // ==========================================
 
-                const elements = document.querySelectorAll(query);
-                
+        async function detectBadContent(text) {{
+
+            // 캐시 사용
+            if (textCache.has(text)) {{
+                return textCache.get(text);
+            }}
+
+            const startTime = performance.now();
+
+            try {{
+                const response = await fetch("http://localhost:8000/api/detect", {{
+                    method: "POST",
+                    headers: {{
+                        "Content-Type": "application/json"
+                    }},
+                    body: JSON.stringify({{
+                        text: text
+                    }})
+                }});
+
+                const result = await response.json();
+
+                const endTime = performance.now();
+                const duration = (endTime - startTime).toFixed(2);
+
+                console.log("걸린 시간", duration + "ms");
+
+                textCache.set(text, result);
+
+                return result;
+
+            }} catch (err) {{
+
+                console.error("[SDK][AI_ERROR]", err);
+
+                return {{
+                    isInappropriate: false,
+                    reason: "AI 서버 오류"
+                }};
+            }}
+        }}
+
+        // ==========================================
+        // 필터링 함수
+        // ==========================================
+
+        async function filterElement(el, query) {{
+
+            if (!el) return;
+
+            if (el.dataset.isFiltered === "true") {{
+                return;
+            }}
+
+            const text = el.innerText || el.textContent;
+
+            if (!text || !text.trim()) {{
+                return;
+            }}
+
+            console.log(
+                `[SDK][SCAN] 검사 시작 → query=${{query}}`
+            );
+
+            console.log(
+                `[SDK][TEXT]`,
+                text.substring(0, 100)
+            );
+
+            const result = await detectBadContent(text);
+
+            if (result.isInappropriate) {{
+
+                console.warn(
+                    `[SDK][🚫 DETECTED] 부적절 콘텐츠 감지`
+                );
+
+                console.warn(
+                    `[SDK][🚫 REASON]`,
+                    result.reason
+                );
+
+                el.dataset.originalHtml = el.innerHTML;
+
+                el.innerHTML = `
+                    <div style="
+                        padding:10px;
+                        border:2px solid red;
+                        background:#fff5f5;
+                        color:red;
+                        font-weight:bold;
+                        border-radius:8px;
+                    ">
+                        🚫 부적절한 콘텐츠가 차단되었습니다.
+                    </div>
+                `;
+            }}
+
+            el.dataset.isFiltered = "true";
+        }}
+
+        // ==========================================
+        // 전체 스캔
+        // ==========================================
+
+        async function checkAndFilter(triggerSource) {{
+
+            console.log(
+                `[SDK][SCAN_START] source=${{triggerSource}}`
+            );
+
+            const totalStart = performance.now();
+
+            let activeMatchCount = 0;
+
+            for (const sel of targetSelectors) {{
+
+                const query = buildQuery(sel);
+
+                if (!query) continue;
+
+                let elements = [];
+
+                try {{
+                    elements = document.querySelectorAll(query);
+
+                }} catch (err) {{
+
+                    console.error(
+                        "[SDK][QUERY_ERROR]",
+                        query,
+                        err
+                    );
+
+                    continue;
+                }}
+
                 if (elements.length > 0) {{
                     activeMatchCount += elements.length;
                 }}
 
-                elements.forEach(el => {{
-                    if (el.dataset.isFiltered === "true") return;
-                    
-                    const text = el.innerText || el.textContent;
-                    if (!text || !text.trim()) return;
-
-                    // 🚀 [UI 렌더링 보호] HTML 구조를 파괴하지 않고 단어만 마스킹
-                    let htmlContent = el.innerHTML;
-                    const badWords = ["시발", "미친"];
-                    let isModified = false;
-
-                    badWords.forEach(word => {{
-                        if (htmlContent.includes(word)) {{
-                            console.log(`[SDK][🎯 MATCH] 쿼리('${{query}}') -> 비속어 발견`);
-                            // 정규식을 사용해 태그 속성은 건드리지 않고 텍스트만 치환
-                            const regex = new RegExp(word, 'g');
-                            htmlContent = htmlContent.replace(regex, `<span style="color:red; font-weight:bold;">🚫금칙어🚫</span>`);
-                            isModified = true;
-                        }}
-                    }});
-
-                    if (isModified) {{
-                        console.log(`[SDK][🚫 FILTER] 안전한 마스킹 처리 완료`);
-                        el.innerHTML = htmlContent;
-                    }}
-                    
-                    // 검사 완료된 엘리먼트는 꼬리표를 달아 무한루프 방지
-                    el.dataset.isFiltered = "true";
-                }});
-            }});
-            
-            if (activeMatchCount === 0 && triggerSource === "PAGE_LOAD") {{
-                console.warn("[SDK][⚠️ WARN] 현재 화면 구조는 DB에 저정된 셀렉터 지도와 일치하지 않습니다. 수집 모듈(Analyzer)로 이 페이지를 스캔해야 합니다.");
+                for (const el of elements) {{
+                    await filterElement(el, query);
+                }}
             }}
+
+            const totalEnd = performance.now();
+
+            console.log(`[SDK][SCAN_END] 총 ${{activeMatchCount}}개 요소 검사 완료 (${{(totalEnd - totalStart).toFixed(2)}}ms)`);
+
+            if (
+                activeMatchCount === 0 &&
+                triggerSource === "PAGE_LOAD"
+            ) {{
+                console.warn(
+                    "[SDK][WARN] 현재 페이지와 저장된 셀렉터가 일치하지 않음"
+                );
+            }}
+        }}
+
+        // ==========================================
+        // 페이지 최초 로딩
+        // ==========================================
+
+        async function init() {{
+            await checkAndFilter("PAGE_LOAD");
         }}
 
         if (document.readyState === 'loading') {{
-            document.addEventListener('DOMContentLoaded', () => checkAndFilter("PAGE_LOAD"));
+            document.addEventListener(
+                'DOMContentLoaded',
+                init
+            );
         }} else {{
-            checkAndFilter("PAGE_LOAD");
+            init();
         }}
 
-        let isFiltering = false;
-        let lastUrl = window.location.href;
+        // ==========================================
+        // Mutation Observer
+        // ==========================================
+
+        let debounceTimer = null;
+        let lastUrl = location.href;
 
         const observer = new MutationObserver((mutations) => {{
-            if (isFiltering) return;
 
-            const currentUrl = window.location.href;
-            const isPageChanged = currentUrl !== lastUrl;
-            
-            if (isPageChanged) {{
-                lastUrl = currentUrl;
-                console.log(`[SDK][🔄 ROUTE] 페이지 이동 감지 -> ${{currentUrl}}`);
-                isFiltering = true;
-                checkAndFilter("PAGE_LOAD"); 
-                isFiltering = false;
-                return;
-            }}
+            clearTimeout(debounceTimer);
 
-            const shouldScan = mutations.some(m => m.addedNodes.length > 0 || m.type === 'characterData');
-            if (shouldScan) {{
-                isFiltering = true; 
-                checkAndFilter("DOM_CHANGE"); 
-                isFiltering = false; 
-            }}
+            debounceTimer = setTimeout(async () => {{
+
+                const currentUrl = location.href;
+
+                // SPA 라우팅 감지
+                if (currentUrl !== lastUrl) {{
+
+                    lastUrl = currentUrl;
+
+                    console.log(
+                        `[SDK][ROUTE_CHANGE] ${{currentUrl}}`
+                    );
+
+                    await checkAndFilter("ROUTE_CHANGE");
+
+                    return;
+                }}
+
+                const shouldScan = mutations.some(
+                    m =>
+                        m.addedNodes.length > 0 ||
+                        m.type === 'characterData'
+                );
+
+                if (shouldScan) {{
+
+                    console.log(
+                        "[SDK][DOM_CHANGE] 변경 감지"
+                    );
+
+                    await checkAndFilter("DOM_CHANGE");
+                }}
+
+            }}, SCAN_DELAY);
         }});
-        
-        observer.observe(document.body, {{ childList: true, subtree: true, characterData: true }});
+
+        observer.observe(document.body, {{
+            childList: true,
+            subtree: true,
+            characterData: true
+        }});
+
+        console.log("[SDK][READY] SDK 준비 완료");
+
     }})();
     """
 
-    return Response(content=js_template, media_type="application/javascript")
-        
-# 정적 파일 서빙
-app.mount("/static", StaticFiles(directory="static"), name="static")
+    return Response(
+        content=js_template,
+        media_type="application/javascript"
+    )
+
+@app.post("/api/detect")
+async def detect_proxy(request: Request):
+    # 1. 프론트에서 데이터 수신
+    try:
+        data = await request.json()
+        text = data.get("text", "")
+        print(f"\n[DEBUG] 🚀 프론트 요청 수신: '{text}'")
+    except Exception as e:
+        print(f"[DEBUG] ❌ JSON 파싱 실패: {e}")
+        return {"isInappropriate": False, "reason": "데이터 파싱 에러"}
+
+    # 2. AI 서버 데이터 변환
+    request_to_ai = {"content": text}
+    
+    # 3. 인퍼런스 엔진 호출
+    async with httpx.AsyncClient() as client:
+        try:
+            print(f"[DEBUG] 🤖 Inference Engine({INFERENCE_ENGINE_URL})으로 전달 중...")
+            
+            response = await client.post(INFERENCE_ENGINE_URL, json=request_to_ai, timeout=5.0)
+            
+            # 응답 상태 확인
+            if response.status_code != 200:
+                print(f"[DEBUG] ⚠️ AI 서버 에러(Status {response.status_code}): {response.text}")
+                return {"isInappropriate": False, "reason": "AI 서버 응답 오류"}
+            
+            ai_result = response.json()
+            print(f"[DEBUG] ✅ AI 서버 최종 응답: {ai_result}")
+            
+            return ai_result
+            
+        except Exception as e:
+            print(f"[DEBUG] ❌ 통신 에러 발생: {str(e)}")
+            return {"isInappropriate": False, "reason": "AI 서버 연결 실패"}

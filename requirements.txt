@@ -7,3 +7,5 @@ playwright
 transformers
 torch
 openai
+torch
+transformers
