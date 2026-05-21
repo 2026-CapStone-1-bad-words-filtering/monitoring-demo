@@ -253,282 +253,159 @@ async def get_domain_agent(domain: str, db: Session = Depends(get_db)):
     # ==========================================
 
     js_template = f"""
-    (function() {{
-        'use strict';
+        (function() {{
+            'use strict';
 
-        console.log("[SDK][INIT] '{site.site_name}' 에이전트 활성화");
-        console.log("[SDK][INIT] 필터 API: /api/detect");
+            // 1. 무한 루프 방지를 위해 원본 객체 미리 저장
+            const originalFetch = window.fetch;
+            const originalXHROpen = XMLHttpRequest.prototype.open;
+            const originalXHRSend = XMLHttpRequest.prototype.send;
 
-        const targetSelectors = {js_selectors_payload};
+            console.log("[SDK][INIT] '{site.site_name}' 에이전트 활성화");
+            console.log("[SDK][INIT] 모든 감시 모듈(DOM + Network) 활성화");
 
-        // ==========================================
-        // 성능 설정
-        // ==========================================
+            const targetSelectors = {js_selectors_payload};
+            const SCAN_DELAY = 300;
+            const textCache = new Map();
 
-        const SCAN_DELAY = 300;
-        const textCache = new Map();
+            // ==========================================
+            // [1] 네트워크 후킹 (Fetch + XHR 통합 차단)
+            // ==========================================
+            function hookNetwork() {{
+                // --- Fetch 후킹 ---
+                window.fetch = async (...args) => {{
+                    let [resource, config] = args;
+                    
+                    // 필터링 API 자신에게 보내는 요청은 즉시 통과
+                    if (typeof resource === 'string' && resource.includes('/api/detect')) {{
+                        return originalFetch(...args);
+                    }}
 
-        // ==========================================
-        // 셀렉터 조합
-        // ==========================================
+                    const method = config ? (config.method || 'GET') : 'GET';
+                    const body = config ? config.body : null;
+                    const url = resource;
+                    
+                    // POST면 Body, GET이면 URL 전체를 검사 대상으로 설정
+                    const contentToCheck = (method === 'POST') ? 
+                                        (typeof body === 'string' ? body : JSON.stringify(body)) : 
+                                        url;
 
-        function buildQuery(selectorObj) {{
-            if (!selectorObj || !selectorObj.tag) return null;
+                    const result = await detectBadContent(contentToCheck);
+                    if (result.isInappropriate) {{
+                        alert("🚫 보안 정책에 의해 차단되었습니다: " + result.reason);
+                        console.warn("[SDK][🚫 BLOCK] 네트워크 요청 차단:", contentToCheck);
+                        throw new Error("보안 정책상 차단된 요청입니다.");
+                    }}
+                    
+                    return originalFetch(...args);
+                }};
 
-            let query = selectorObj.tag;
+                // --- XHR 후킹 (jQuery/Axios 대응) ---
+                XMLHttpRequest.prototype.open = function(method, url) {{
+                    this._url = url;
+                    this._method = method;
+                    return originalXHROpen.apply(this, arguments);
+                }};
 
-            if (selectorObj.className) {{
-                const classes = selectorObj.className
-                    .split(' ')
-                    .filter(c => c)
-                    .join('.');
-
-                if (classes) {{
-                    query += `.${{classes}}`;
-                }}
-            }}
-
-            return query;
-        }}
-
-        // ==========================================
-        // AI 검사 함수
-        // ==========================================
-
-        async function detectBadContent(text) {{
-
-            // 캐시 사용
-            if (textCache.has(text)) {{
-                return textCache.get(text);
-            }}
-
-            const startTime = performance.now();
-
-            try {{
-                const response = await fetch("http://localhost:8000/api/detect", {{
-                    method: "POST",
-                    headers: {{
-                        "Content-Type": "application/json"
-                    }},
-                    body: JSON.stringify({{
-                        text: text
-                    }})
-                }});
-
-                const result = await response.json();
-
-                const endTime = performance.now();
-                const duration = (endTime - startTime).toFixed(2);
-
-                console.log("걸린 시간", duration + "ms");
-
-                textCache.set(text, result);
-
-                return result;
-
-            }} catch (err) {{
-
-                console.error("[SDK][AI_ERROR]", err);
-
-                return {{
-                    isInappropriate: false,
-                    reason: "AI 서버 오류"
+                XMLHttpRequest.prototype.send = async function(body) {{
+                    if (this._url && this._url.includes('/api/detect')) return originalXHRSend.apply(this, arguments);
+                    
+                    const contentToCheck = (this._method === 'POST') ? (body || "") : this._url;
+                    
+                    const result = await detectBadContent(contentToCheck);
+                    if (result.isInappropriate) {{
+                        alert("🚫 보안 정책에 의해 차단되었습니다: " + result.reason);
+                        console.warn("[SDK][🚫 BLOCK] XHR 요청 차단:", contentToCheck);
+                        this.abort(); 
+                        return;
+                    }}
+                    return originalXHRSend.apply(this, arguments);
                 }};
             }}
-        }}
 
-        // ==========================================
-        // 필터링 함수
-        // ==========================================
-
-        async function filterElement(el, query) {{
-
-            if (!el) return;
-
-            if (el.dataset.isFiltered === "true") {{
-                return;
-            }}
-
-            const text = el.innerText || el.textContent;
-
-            if (!text || !text.trim()) {{
-                return;
-            }}
-
-            console.log(
-                `[SDK][SCAN] 검사 시작 → query=${{query}}`
-            );
-
-            console.log(
-                `[SDK][TEXT]`,
-                text.substring(0, 100)
-            );
-
-            const result = await detectBadContent(text);
-
-            if (result.isInappropriate) {{
-
-                console.warn(
-                    `[SDK][🚫 DETECTED] 부적절 콘텐츠 감지`
-                );
-
-                console.warn(
-                    `[SDK][🚫 REASON]`,
-                    result.reason
-                );
-
-                el.dataset.originalHtml = el.innerHTML;
-
-                el.innerHTML = `
-                    <div style="
-                        padding:10px;
-                        border:2px solid red;
-                        background:#fff5f5;
-                        color:red;
-                        font-weight:bold;
-                        border-radius:8px;
-                    ">
-                        🚫 부적절한 콘텐츠가 차단되었습니다.
-                    </div>
-                `;
-            }}
-
-            el.dataset.isFiltered = "true";
-        }}
-
-        // ==========================================
-        // 전체 스캔
-        // ==========================================
-
-        async function checkAndFilter(triggerSource) {{
-
-            console.log(
-                `[SDK][SCAN_START] source=${{triggerSource}}`
-            );
-
-            const totalStart = performance.now();
-
-            let activeMatchCount = 0;
-
-            for (const sel of targetSelectors) {{
-
-                const query = buildQuery(sel);
-
-                if (!query) continue;
-
-                let elements = [];
+            // ==========================================
+            // [2] AI 검사 공통 함수
+            // ==========================================
+            async function detectBadContent(text) {{
+                if (!text || text.trim() === "") return {{ isInappropriate: false }};
+                const checkText = text.length > 2000 ? text.substring(0, 2000) : text;
+                if (textCache.has(checkText)) return textCache.get(checkText);
 
                 try {{
-                    elements = document.querySelectorAll(query);
+                    // 무조건 원본 fetch 사용
+                    const response = await originalFetch("http://localhost:8000/api/detect", {{
+                        method: "POST",
+                        headers: {{ "Content-Type": "application/json" }},
+                        body: JSON.stringify({{ text: checkText }})
+                    }});
 
+                    const result = await response.json();
+                    textCache.set(checkText, result);
+                    return result;
                 }} catch (err) {{
-
-                    console.error(
-                        "[SDK][QUERY_ERROR]",
-                        query,
-                        err
-                    );
-
-                    continue;
-                }}
-
-                if (elements.length > 0) {{
-                    activeMatchCount += elements.length;
-                }}
-
-                for (const el of elements) {{
-                    await filterElement(el, query);
+                    console.error("[SDK][AI_ERROR]", err);
+                    return {{ isInappropriate: false, reason: "AI 서버 오류" }};
                 }}
             }}
 
-            const totalEnd = performance.now();
-
-            console.log(`[SDK][SCAN_END] 총 ${{activeMatchCount}}개 요소 검사 완료 (${{(totalEnd - totalStart).toFixed(2)}}ms)`);
-
-            if (
-                activeMatchCount === 0 &&
-                triggerSource === "PAGE_LOAD"
-            ) {{
-                console.warn(
-                    "[SDK][WARN] 현재 페이지와 저장된 셀렉터가 일치하지 않음"
-                );
+            // ==========================================
+            // [3] DOM 필터링 관련 함수들
+            // ==========================================
+            function buildQuery(selectorObj) {{
+                if (!selectorObj || !selectorObj.tag) return null;
+                let query = selectorObj.tag;
+                if (selectorObj.className) {{
+                    const classes = selectorObj.className.split(' ').filter(c => c).join('.');
+                    if (classes) query += `.${{classes}}`;
+                }}
+                return query;
             }}
-        }}
 
-        // ==========================================
-        // 페이지 최초 로딩
-        // ==========================================
+            async function filterElement(el) {{
+                if (!el || el.dataset.isFiltered === "true") return;
+                const text = el.innerText || el.textContent;
+                if (!text || !text.trim()) return;
 
-        async function init() {{
-            await checkAndFilter("PAGE_LOAD");
-        }}
-
-        if (document.readyState === 'loading') {{
-            document.addEventListener(
-                'DOMContentLoaded',
-                init
-            );
-        }} else {{
-            init();
-        }}
-
-        // ==========================================
-        // Mutation Observer
-        // ==========================================
-
-        let debounceTimer = null;
-        let lastUrl = location.href;
-
-        const observer = new MutationObserver((mutations) => {{
-
-            clearTimeout(debounceTimer);
-
-            debounceTimer = setTimeout(async () => {{
-
-                const currentUrl = location.href;
-
-                // SPA 라우팅 감지
-                if (currentUrl !== lastUrl) {{
-
-                    lastUrl = currentUrl;
-
-                    console.log(
-                        `[SDK][ROUTE_CHANGE] ${{currentUrl}}`
-                    );
-
-                    await checkAndFilter("ROUTE_CHANGE");
-
-                    return;
+                const result = await detectBadContent(text);
+                if (result.isInappropriate) {{
+                    console.warn("[SDK][🚫 DETECTED] 화면 콘텐츠 차단:", result.reason);
+                    el.dataset.originalHtml = el.innerHTML;
+                    el.innerHTML = `<div style="padding:10px; border:2px solid red; background:#fff5f5; color:red; font-weight:bold; border-radius:8px;">🚫 부적절한 콘텐츠 차단</div>`;
                 }}
+                el.dataset.isFiltered = "true";
+            }}
 
-                const shouldScan = mutations.some(
-                    m =>
-                        m.addedNodes.length > 0 ||
-                        m.type === 'characterData'
-                );
-
-                if (shouldScan) {{
-
-                    console.log(
-                        "[SDK][DOM_CHANGE] 변경 감지"
-                    );
-
-                    await checkAndFilter("DOM_CHANGE");
+            async function checkAndFilter() {{
+                for (const sel of targetSelectors) {{
+                    const query = buildQuery(sel);
+                    if (!query) continue;
+                    const elements = document.querySelectorAll(query);
+                    for (const el of elements) {{ await filterElement(el); }}
                 }}
+            }}
 
-            }}, SCAN_DELAY);
-        }});
+            // ==========================================
+            // [4] 시작 및 초기화
+            // ==========================================
+            async function init() {{
+                hookNetwork(); // 네트워크 감시 시작 (GET/POST/XHR)
+                await checkAndFilter();
+            }}
 
-        observer.observe(document.body, {{
-            childList: true,
-            subtree: true,
-            characterData: true
-        }});
+            if (document.readyState === 'loading') {{
+                document.addEventListener('DOMContentLoaded', init);
+            }} else {{
+                init();
+            }}
 
-        console.log("[SDK][READY] SDK 준비 완료");
+            const observer = new MutationObserver(() => {{
+                setTimeout(checkAndFilter, SCAN_DELAY);
+            }});
+            observer.observe(document.body, {{ childList: true, subtree: true, characterData: true }});
 
-    }})();
-    """
+            console.log("[SDK][READY] SDK 모든 기능 활성화 완료");
+        }})();
+        """
 
     return Response(
         content=js_template,
