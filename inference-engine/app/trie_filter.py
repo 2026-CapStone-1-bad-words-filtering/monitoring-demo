@@ -190,8 +190,18 @@ class ProfanityFilterTrie:
 
         return result
 
+    # 기존 ProfanityFilterTrie 클래스 내부의 normalize_text 함수를 아래 버전으로 덮어쓰세요.
     def normalize_text(self, text: str) -> str:
+        import re
         text = text.lower()
+        
+        text = re.sub(r'시+이*발+', '시발', text)
+        text = re.sub(r'씨+이*발+', '씨발', text)
+        text = re.sub(r'존+나+', '존나', text)
+        text = re.sub(r'지+랄+', '지랄', text)
+        text = re.sub(r'미+친+', '미친', text)
+        text = re.sub(r'병+신+', '병신', text)
+        
         replacements = {
             "^^ㅣ": "씨",
             "^ㅣ": "씨",

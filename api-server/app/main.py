@@ -3,27 +3,30 @@ import os
 import json
 import asyncio
 import httpx
+import ast
+from typing import List, Optional
 import websockets
 from urllib.parse import urlparse
-import ast
-import httpx
-from fastapi import Request
-from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, Response
+
+from fastapi import Request, FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from json import dumps
+from sqlalchemy import func
+from datetime import datetime, timedelta
 
-# 기존 프로젝트 내부 모듈 참조
+# 프로젝트 내부 모듈 참조
 from . import database, models, db_handler, schemas
-from .models import Site, BoardStructure  # 스키마
-from .database import get_db, Base        # DB 세션 설정
+from .models import Site, BoardStructure, User, UserSetting, DetectionLog
+from .database import get_db, Base
+from pydantic import BaseModel
+from typing import List
 
 app = FastAPI(title="Filtering System Control Tower")
 
-# CORS 설정
+# CORS 전면 개방 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,17 +35,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# DB 테이블 자동 생성
-models.Base.metadata.create_all(bind=database.engine)
+class BulkDetectRequest(BaseModel):
+    texts: List[str]
+    extension_mode: bool = True
+    user_id: int = 1
+
 INFERENCE_ENGINE_URL = "http://inference-engine:8080/detect"
 
-# DB 의존성 주입 함수
-def get_db():
-    db = database.SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# DB 테이블 자동 생성 및 초기화
+print("\n[DB_INIT] 🗑️ 매 실행 시 초기화를 위해 기존 테이블을 전체 삭제합니다...")
+Base.metadata.drop_all(bind=database.engine)
+print("[DB_INIT] ✨ 신규 테이블을 생성합니다...")
+Base.metadata.create_all(bind=database.engine)
+print("[DB_INIT] ✅ 데이터베이스 테이블 준비 완료.\n")
 
 # ==========================================
 # [1] 원격 로그인 세션 관리 (WebSocket Proxy)
@@ -50,399 +55,577 @@ def get_db():
 
 @app.post("/auth/start-login")
 async def start_login(payload: dict):
-    """analyzer(수집기) 컨테이너에게 브라우저 인스턴스 생성을 요청합니다."""
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post("http://analyzer:8000/auth/start-session", json=payload)
+            response = await client.post("http://filtering_analyzer:8000/auth/start-session", json=payload)
             return response.json()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Analyzer 연결 실패: {str(e)}")
 
 @app.websocket("/ws/remote-login/{session_id}")
 async def proxy_remote_login(websocket: WebSocket, session_id: str):
-    """
-    프론트엔드와 analyzer 사이의 브라우저 화면/입력 데이터를 실시간 중계합니다.
-    """
     await websocket.accept()
-    
-    # analyzer 컨테이너의 내부 WebSocket 주소
-    analyzer_ws_url = f"ws://analyzer:8000/ws/stream/{session_id}"
-    
+    analyzer_ws_url = f"ws://filtering_analyzer:8000/ws/stream/{session_id}"
     try:
         async with websockets.connect(analyzer_ws_url) as analyzer_ws:
             async def forward_to_analyzer():
-                """사용자의 입력을 analyzer로 전달"""
                 async for message in websocket.iter_text():
                     await analyzer_ws.send(message)
-
             async def forward_to_client():
-                """analyzer의 화면 데이터를 클라이언트로 전달"""
                 async for message in analyzer_ws:
                     await websocket.send_bytes(message)
-
-            # 두 태스크를 병렬로 실행하여 양방향 통신 유지
             await asyncio.gather(forward_to_analyzer(), forward_to_client())
-            
     except WebSocketDisconnect:
-        print(f"[WS] Client disconnected: {session_id}")
+        pass
     except Exception as e:
         print(f"[WS_ERROR] Proxy error: {e}")
     finally:
-        await websocket.close()
+        try: await websocket.close()
+        except: pass
 
 
 # ==========================================
-# [2] 실시간 분석 로그 중계 및 DB 자동 저장 (Proxy)
+# [2] 실시간 분석 로그 중계 및 구조 저장
 # ==========================================
 
 @app.get("/analyze/stream")
-async def proxy_analysis_stream(
-    url: str = Query(..., description="분석할 대상 URL"), 
-    db: Session = Depends(get_db)
-):
-    """
-    Analyzer의 크롤링 과정을 프론트로 스트리밍하고, 최종 결과는 가로채서 DB에 저장합니다.
-    """
+async def proxy_analysis_stream(url: str = Query(..., description="분석할 대상 URL"), user_id: Optional[int] = Query(None, description="유저 고유 ID"), db: Session = Depends(get_db)):
+    target_user_id = user_id if user_id is not None else 1
+    print(f"\n[STREAM_DEBUG] 🚀 실시간 로그 감시 및 듀얼 캡처 파이프라인 가동")
+
     async def log_proxy():
-        analyzer_base_url = "http://analyzer:8000/analyze/stream"
-        
+        analyzer_base_url = "http://filtering_analyzer:8000/analyze/stream"
+        streamed_boards = {} 
+        db_saved_flag = False
         async with httpx.AsyncClient(timeout=None) as client:
-            # url 파라미터를 params로 넘겨 안전하게 인코딩 처리
             async with client.stream("GET", analyzer_base_url, params={"url": url}) as response:
                 async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    
-                    # 1. 프론트엔드로 로그를 중계 (스트리밍)
+                    if not line: continue
                     yield f"{line}\n\n"
+                    clean_line = line.strip()
                     
-                    # 2. 결과값이 떨어지면 가로채서 파싱 후 DB에 저장
-                    if "[RESULT]" in line:
+                    if "[PARSER]" in clean_line and "수집 완료:" in clean_line:
                         try:
-                            result_json_str = line.split("[RESULT] ")[-1].strip()
-                            analysis_data = json.loads(result_json_str)
-                            domain = urlparse(url).netloc
-                            
-                            # 🚀 DB 저장은 스레드풀로 넘겨 메인 API 서버 블로킹 방지
-                            await run_in_threadpool(
-                                db_handler.save_analysis_results, 
-                                db, 
-                                domain, 
-                                analysis_data
-                            )
-                            yield f"[SYSTEM] {domain} 구조 분석 데이터 DB 저장 완료\n\n"
-                            
-                        except Exception as e:
-                            yield f"[DB_ERROR] 데이터 저장 실패: {str(e)}\n\n"
+                            parser_part = clean_line.split("[PARSER]")[-1].strip()
+                            mid = parser_part.split("]")[0].replace("[", "").strip()
+                            selector = parser_part.split("수집 완료:")[-1].strip()
+                            if mid and selector:
+                                if mid not in streamed_boards: streamed_boards[mid] = []
+                                if selector not in streamed_boards[mid]: streamed_boards[mid].append(selector)
+                        except: pass
 
+                    if ("[RESULT]" in clean_line or "스캔 및 아키텍처 매핑 완료" in clean_line) and not db_saved_flag:
+                        db_saved_flag = True
+                        analysis_data = {}
+                        if "[RESULT]" in clean_line:
+                            try: analysis_data = json.loads(clean_line.split("[RESULT] ")[-1].strip())
+                            except: pass
+                        domain = url.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0].strip()
+                        try:
+                            await run_in_threadpool(save_multi_site_analysis_results_logged, db, domain, analysis_data, target_user_id, streamed_boards)
+                            yield f"[SYSTEM] 📊 다중 사이트 격리 완료: 도메인 '{domain}'이 자산으로 등록되었습니다.\n\n"
+                        except Exception as e:
+                            yield f"[DB_ERROR] 데이터 적재 실패: {str(e)}\n\n"
     return StreamingResponse(log_proxy(), media_type="text/event-stream")
+
+def save_multi_site_analysis_results_logged(db: Session, domain: str, analysis_data: dict, user_id: int, streamed_boards: dict):
+    clean_domain = domain.strip()
+    site = db.query(models.Site).filter(models.Site.domain == clean_domain, models.Site.user_id == user_id).first()
+    if not site:
+        site = models.Site(domain=clean_domain, site_name=f"{clean_domain} 쇼핑몰", user_id=user_id)
+        db.add(site)
+        db.flush()
+    setting = db.query(models.UserSetting).filter(models.UserSetting.site_id == site.id).first()
+    if not setting:
+        db.add(models.UserSetting(user_id=user_id, site_id=site.id, preferences={"banned_types": [], "is_active": True, "sensitivity": "medium", "custom_keywords": []}))
+        db.flush()
+    db.query(models.BoardStructure).filter(models.BoardStructure.site_id == site.id).delete()
+    
+    merged_boards = {}
+    for mid, selectors in streamed_boards.items(): merged_boards[mid] = set(selectors)
+    
+    if isinstance(analysis_data, dict) and "boards" in analysis_data:
+        for b in analysis_data.get("boards", []):
+            b_mid = b.get("mid", "unknown")
+            b_selectors = b.get("selectors", [])
+            if b_mid not in merged_boards: merged_boards[b_mid] = set()
+            if isinstance(b_selectors, list):
+                for sel in b_selectors: merged_boards[b_mid].add(str(sel))
+            elif isinstance(b_selectors, str): merged_boards[b_mid].add(b_selectors)
+            
+    for mid, selectors_set in merged_boards.items():
+        db.add(models.BoardStructure(site_id=site.id, mid=mid, get_selectors=json.dumps(list(selectors_set), ensure_ascii=False), is_verified=True))
+    db.commit()
 
 
 # ==========================================
-# [3] 설정값 조회 API (수집 스크립트용)
+# [3] 설정값 및 AI 실시간 필터링 통신 API
 # ==========================================
 
 @app.get("/config/{domain}")
 async def get_site_config(domain: str, db: Session = Depends(get_db)):
-    """DB에 저장된 특정 사이트의 구조 데이터를 반환합니다."""
     site = db.query(Site).filter(Site.domain == domain).first()
-    if not site:
-        raise HTTPException(status_code=404, detail="등록되지 않은 도메인입니다.")
-    
+    if not site: raise HTTPException(status_code=404, detail="등록되지 않은 도메인입니다.")
     structures = db.query(BoardStructure).filter(BoardStructure.site_id == site.id).all()
     return {"domain": domain, "boards": structures}
 
-
-# ==========================================
-# [4] 실시간 필터링 API (Inference Engine 연동)
-# ==========================================
-
-@app.post("/filter")
-async def filter_content(payload: schemas.FilterRequest):
-    """
-    프론트에서 들어온 텍스트를 AI 모델 서버(inference-engine)로 보내 판별합니다.
-    """
-    async with httpx.AsyncClient() as client:
-        try:
-            # inference-engine 컨테이너 호출 (포트 8080 가정)
-            response = await client.post(
-                "http://inference-engine:8080/predict", 
-                json={"text": payload.content},
-                timeout=5.0
-            )
-            result = response.json()
-            is_bad = result.get("is_bad", False)
-            
-            return {
-                "is_filtered": is_bad,
-                "action": "mask" if is_bad else "none",
-                "modified_content": payload.content.replace(payload.content, "***") if is_bad else payload.content
-            }
-        except Exception as e:
-            # 모델 서버 장애 시 기본 키워드 필터링(Fallback) 작동
-            print(f"[AI_ERROR] Inference engine 호출 실패: {e}")
-            is_bad = "욕설" in payload.content
-            return {
-                "is_filtered": is_bad,
-                "action": "mask" if is_bad else "none",
-                "modified_content": payload.content.replace("욕설", "***") if is_bad else payload.content
-            }
-
-# ==========================================
-# [5] 동적 JS SDK 에이전트 발급
-# ==========================================
-
-@app.get("/agent/{domain}.js")
-async def get_domain_agent(domain: str, db: Session = Depends(get_db)):
-    # 1. DB에서 사이트 조회
-    site = db.query(Site).filter(Site.domain == domain).first()
-
-    if not site:
-        if "localhost" in domain or "127.0.0.1" in domain:
-            site = db.query(Site).filter(
-                Site.domain.contains("host.docker.internal")
-            ).first()
-
-        if not site:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Site not found: {domain}"
-            )
-
-    # 2. 구조 정보 병합
-    structures = db.query(BoardStructure).filter(
-        BoardStructure.site_id == site.id
-    ).all()
-
-    all_selectors = []
-
-    print(f"\n--- [에이전트 발급 디버깅: {domain}] ---")
-    print(f"찾아낸 게시판 구조 개수: {len(structures)}개")
-
-    for struct in structures:
-        db_selectors = struct.get_selectors
-
-        print(f"[DEBUG] 꺼낸 데이터: {db_selectors}")
-        print(f"[DEBUG] 데이터 타입: {type(db_selectors)}")
-
-        if db_selectors:
-
-            if isinstance(db_selectors, str):
-                try:
-                    db_selectors = json.loads(db_selectors)
-
-                except json.JSONDecodeError:
-                    try:
-                        db_selectors = ast.literal_eval(db_selectors)
-
-                    except Exception as e:
-                        print(f"[DB_PARSE_ERROR] 변환 실패 ({struct.mid}): {e}")
-                        continue
-
-            if isinstance(db_selectors, list):
-                all_selectors.extend(db_selectors)
-            else:
-                all_selectors.append(db_selectors)
-
-    print(f"최종 병합된 셀렉터 개수: {len(all_selectors)}개\n")
-
-    js_selectors_payload = dumps(all_selectors, ensure_ascii=False)
-
-    # ==========================================
-    # JS SDK 생성
-    # ==========================================
-
-    js_template = f"""
-        (function() {{
-            'use strict';
-
-            // 1. 무한 루프 방지를 위해 원본 객체 미리 저장
-            const originalFetch = window.fetch;
-            const originalXHROpen = XMLHttpRequest.prototype.open;
-            const originalXHRSend = XMLHttpRequest.prototype.send;
-
-            console.log("[SDK][INIT] '{site.site_name}' 에이전트 활성화");
-            console.log("[SDK][INIT] 모든 감시 모듈(DOM + Network) 활성화");
-
-            const targetSelectors = {js_selectors_payload};
-            const SCAN_DELAY = 300;
-            const textCache = new Map();
-
-            // ==========================================
-            // [1] 네트워크 후킹 (Fetch + XHR 통합 차단)
-            // ==========================================
-            function hookNetwork() {{
-                // --- Fetch 후킹 ---
-                window.fetch = async (...args) => {{
-                    let [resource, config] = args;
-                    
-                    // 필터링 API 자신에게 보내는 요청은 즉시 통과
-                    if (typeof resource === 'string' && resource.includes('/api/detect')) {{
-                        return originalFetch(...args);
-                    }}
-
-                    const method = config ? (config.method || 'GET') : 'GET';
-                    const body = config ? config.body : null;
-                    const url = resource;
-                    
-                    // POST면 Body, GET이면 URL 전체를 검사 대상으로 설정
-                    const contentToCheck = (method === 'POST') ? 
-                                        (typeof body === 'string' ? body : JSON.stringify(body)) : 
-                                        url;
-
-                    const result = await detectBadContent(contentToCheck);
-                    if (result.isInappropriate) {{
-                        alert("🚫 보안 정책에 의해 차단되었습니다: " + result.reason);
-                        console.warn("[SDK][🚫 BLOCK] 네트워크 요청 차단:", contentToCheck);
-                        throw new Error("보안 정책상 차단된 요청입니다.");
-                    }}
-                    
-                    return originalFetch(...args);
-                }};
-
-                // --- XHR 후킹 (jQuery/Axios 대응) ---
-                XMLHttpRequest.prototype.open = function(method, url) {{
-                    this._url = url;
-                    this._method = method;
-                    return originalXHROpen.apply(this, arguments);
-                }};
-
-                XMLHttpRequest.prototype.send = async function(body) {{
-                    if (this._url && this._url.includes('/api/detect')) return originalXHRSend.apply(this, arguments);
-                    
-                    const contentToCheck = (this._method === 'POST') ? (body || "") : this._url;
-                    
-                    const result = await detectBadContent(contentToCheck);
-                    if (result.isInappropriate) {{
-                        alert("🚫 보안 정책에 의해 차단되었습니다: " + result.reason);
-                        console.warn("[SDK][🚫 BLOCK] XHR 요청 차단:", contentToCheck);
-                        this.abort(); 
-                        return;
-                    }}
-                    return originalXHRSend.apply(this, arguments);
-                }};
-            }}
-
-            // ==========================================
-            // [2] AI 검사 공통 함수
-            // ==========================================
-            async function detectBadContent(text) {{
-                if (!text || text.trim() === "") return {{ isInappropriate: false }};
-                const checkText = text.length > 2000 ? text.substring(0, 2000) : text;
-                if (textCache.has(checkText)) return textCache.get(checkText);
-
-                try {{
-                    // 무조건 원본 fetch 사용
-                    const response = await originalFetch("http://localhost:8000/api/detect", {{
-                        method: "POST",
-                        headers: {{ "Content-Type": "application/json" }},
-                        body: JSON.stringify({{ text: checkText }})
-                    }});
-
-                    const result = await response.json();
-                    textCache.set(checkText, result);
-                    return result;
-                }} catch (err) {{
-                    console.error("[SDK][AI_ERROR]", err);
-                    return {{ isInappropriate: false, reason: "AI 서버 오류" }};
-                }}
-            }}
-
-            // ==========================================
-            // [3] DOM 필터링 관련 함수들
-            // ==========================================
-            function buildQuery(selectorObj) {{
-                if (!selectorObj || !selectorObj.tag) return null;
-                let query = selectorObj.tag;
-                if (selectorObj.className) {{
-                    const classes = selectorObj.className.split(' ').filter(c => c).join('.');
-                    if (classes) query += `.${{classes}}`;
-                }}
-                return query;
-            }}
-
-            async function filterElement(el) {{
-                if (!el || el.dataset.isFiltered === "true") return;
-                const text = el.innerText || el.textContent;
-                if (!text || !text.trim()) return;
-
-                const result = await detectBadContent(text);
-                if (result.isInappropriate) {{
-                    console.warn("[SDK][🚫 DETECTED] 화면 콘텐츠 차단:", result.reason);
-                    el.dataset.originalHtml = el.innerHTML;
-                    el.innerHTML = `<div style="padding:10px; border:2px solid red; background:#fff5f5; color:red; font-weight:bold; border-radius:8px;">🚫 부적절한 콘텐츠 차단</div>`;
-                }}
-                el.dataset.isFiltered = "true";
-            }}
-
-            async function checkAndFilter() {{
-                for (const sel of targetSelectors) {{
-                    const query = buildQuery(sel);
-                    if (!query) continue;
-                    const elements = document.querySelectorAll(query);
-                    for (const el of elements) {{ await filterElement(el); }}
-                }}
-            }}
-
-            // ==========================================
-            // [4] 시작 및 초기화
-            // ==========================================
-            async function init() {{
-                hookNetwork(); // 네트워크 감시 시작 (GET/POST/XHR)
-                await checkAndFilter();
-            }}
-
-            if (document.readyState === 'loading') {{
-                document.addEventListener('DOMContentLoaded', init);
-            }} else {{
-                init();
-            }}
-
-            const observer = new MutationObserver(() => {{
-                setTimeout(checkAndFilter, SCAN_DELAY);
-            }});
-            observer.observe(document.body, {{ childList: true, subtree: true, characterData: true }});
-
-            console.log("[SDK][READY] SDK 모든 기능 활성화 완료");
-        }})();
-        """
-
-    return Response(
-        content=js_template,
-        media_type="application/javascript"
-    )
+def save_detection_log(user_id: int, stage: str, reason: str, blocked_content: str):
+    db = database.SessionLocal()
+    try:
+        # 🚀 로그 저장 시 유저가 입력했던 순수 정제 텍스트를 함께 저장합니다.
+        db.add(models.DetectionLog(
+            user_id=user_id, 
+            stage=stage, 
+            reason=reason,
+            blocked_content=blocked_content
+        ))
+        db.commit()
+    except Exception as e: 
+        db.rollback()
+        print(f"[DB_ERROR] 로그 저장 중 예외 발생: {str(e)}")
+    finally: 
+        db.close()
 
 @app.post("/api/detect")
-async def detect_proxy(request: Request):
-    # 1. 프론트에서 데이터 수신
-    try:
-        data = await request.json()
-        text = data.get("text", "")
-        print(f"\n[DEBUG] 🚀 프론트 요청 수신: '{text}'")
-    except Exception as e:
-        print(f"[DEBUG] ❌ JSON 파싱 실패: {e}")
-        return {"isInappropriate": False, "reason": "데이터 파싱 에러"}
+async def detect_proxy(payload: schemas.FilterProxyRequest, background_tasks: BackgroundTasks):
+    text = payload.text
+    target_user_id = payload.user_id
+    print(f"\n[DEBUG] 🚀 필터링 요청 수신 | User ID: {target_user_id} | 수신 데이터: '{text}'")
 
-    # 2. AI 서버 데이터 변환
-    request_to_ai = {"content": text}
-    
-    # 3. 인퍼런스 엔진 호출
+    # 🛡️ 백엔드 이중 방어선: 혹시라도 프론트에서 JSON 껍데기가 들어오면 강제로 순수 텍스트만 도려냅니다.
+    cleaned_text = text.strip()
+    if cleaned_text.startswith('{') and cleaned_text.endswith('}'):
+        try:
+            parsed = json.loads(cleaned_text)
+            if isinstance(parsed, dict):
+                # 프레임워크 노이즈 필터링
+                if parsed.get("frames") or parsed.get("isServer"):
+                    return {"isInappropriate": False, "stage": "safe", "reason": "시스템 노이즈 패스"}
+                # 알맹이 텍스트(value)만 긁어모아 결합
+                text_values = [str(v) for v in parsed.values() if isinstance(v, str) and v.strip()]
+                cleaned_text = " ".join(text_values)
+                print(f"[DEBUG] ⚠️ JSON 껍데기 감지 -> 순수 텍스트 강제 정제 완료: '{cleaned_text}'")
+        except:
+            pass
+
+    if not cleaned_text.strip():
+        return {"isInappropriate": False, "stage": "safe", "reason": "내용 없음"}
+
     async with httpx.AsyncClient() as client:
         try:
-            print(f"[DEBUG] 🤖 Inference Engine({INFERENCE_ENGINE_URL})으로 전달 중...")
-            
-            response = await client.post(INFERENCE_ENGINE_URL, json=request_to_ai, timeout=5.0)
-            
-            # 응답 상태 확인
+            # 🚀 타임아웃 15초 유지 (로컬 BERT 연산 대기 보장)
+            response = await client.post(INFERENCE_ENGINE_URL, json={"content": cleaned_text}, timeout=15.0)
             if response.status_code != 200:
-                print(f"[DEBUG] ⚠️ AI 서버 에러(Status {response.status_code}): {response.text}")
                 return {"isInappropriate": False, "reason": "AI 서버 응답 오류"}
             
             ai_result = response.json()
             print(f"[DEBUG] ✅ AI 서버 최종 응답: {ai_result}")
             
+            if ai_result.get("isInappropriate"):
+                # 🚀 [핵심] 네 번째 인자로 정제된 순수 텍스트(cleaned_text)를 함께 넘겨줍니다.
+                background_tasks.add_task(
+                    save_detection_log, 
+                    user_id=target_user_id, 
+                    stage=ai_result.get("stage", "unknown"), 
+                    reason=ai_result.get("reason", "비속어 탐지"),
+                    blocked_content=cleaned_text  # 👈 추가
+                )
             return ai_result
-            
         except Exception as e:
-            print(f"[DEBUG] ❌ 통신 에러 발생: {str(e)}")
+            print(f"[DEBUG] ❌ AI 서버 통신 에러: {str(e)}")
             return {"isInappropriate": False, "reason": "AI 서버 연결 실패"}
+
+
+# ==============================================================================
+# [4] ⚡ 동적 JS SDK 에이전트 발급 라우터 (DOM 파싱 로직 완벽 복원)
+# ==============================================================================
+
+@app.get("/agent/{agent_slug}.js")
+async def get_identifiable_agent(agent_slug: str, db: Session = Depends(get_db)):
+    print(f"\n[AGENT_DEBUG] 📥 에이전트 요청 수신: 원본 slug = '{agent_slug}'")
+    
+    if "_" not in agent_slug: 
+        print("[AGENT_DEBUG] ❌ 잘못된 Slug 포맷 (언더바 없음)")
+        return Response(content="console.error('Invalid Slug');", media_type="application/javascript")
+        
+    try:
+        user_id_str, domain = agent_slug.replace(".js", "").split("_", 1)
+        user_id = int(user_id_str)
+        print(f"[AGENT_DEBUG] 🔍 파싱 결과 -> User ID: {user_id}, 요청 도메인: '{domain}'")
+    except Exception as e: 
+        print(f"[AGENT_DEBUG] ❌ User ID 파싱 실패: {str(e)}")
+        return Response(content="console.error('Invalid User ID');", media_type="application/javascript")
+
+    clean_domain = domain.strip().replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+    print(f"[AGENT_DEBUG] 🧹 정제된 검색용 도메인(clean_domain): '{clean_domain}'")
+    
+    # 1차 검색: 유저 ID와 도메인 부분 일치 검색
+    site = db.query(models.Site).filter(models.Site.user_id == user_id, models.Site.domain.contains(clean_domain)).first()
+    
+    # 2차 검색 (Fallback): 도메인이 안 맞으면 해당 유저의 첫 번째 사이트로 강제 매핑 시도
+    if not site: 
+        print(f"[AGENT_DEBUG] ⚠️ '{clean_domain}' 도메인 일치 실패, 유저({user_id})의 기본 사이트 검색 시도...")
+        site = db.query(models.Site).filter(models.Site.user_id == user_id).first()
+        
+    if not site: 
+        print(f"[AGENT_DEBUG] ❌ DB에서 유저({user_id})의 사이트를 전혀 찾을 수 없음 (Site Not Found)")
+        return Response(content="console.error('Site Not Found');", media_type="application/javascript")
+
+    print(f"[AGENT_DEBUG] ✅ 최종 매핑된 사이트 -> ID: {site.id}, Name: '{site.site_name}', DB Domain: '{site.domain}'")
+
+    structures = db.query(models.BoardStructure).filter(models.BoardStructure.site_id == site.id).all()
+    print(f"[AGENT_DEBUG] 📋 DB에서 가져온 BoardStructure(게시판 구조) 개수: {len(structures)}개")
+    
+    # 🚀 DOM 셀렉터를 문자열이 아닌 JSON 객체(dict) 형태로 온전히 복원하는 로직
+    seen = set()
+    unique_selectors = []
+    
+    for struct in structures:
+        db_selectors = struct.get_selectors 
+        if db_selectors:
+            if isinstance(db_selectors, str):
+                try: db_selectors = json.loads(db_selectors)
+                except:
+                    try: db_selectors = ast.literal_eval(db_selectors)
+                    except: continue
+            
+            # 리스트 안에 든 객체({tag, className}) 또는 문자열 추출
+            items = db_selectors if isinstance(db_selectors, list) else [db_selectors]
+            for s in items:
+                if isinstance(s, dict) and "tag" in s:
+                    k = (s.get("tag"), s.get("className", ""))
+                    if k not in seen:
+                        seen.add(k)
+                        unique_selectors.append({"tag": s.get("tag"), "className": s.get("className", "")})
+                elif isinstance(s, str) and s.strip():
+                    # 수동으로 태그 문자열이 들어왔을 경우 객체로 규격 통일
+                    k = (s.strip(), "")
+                    if k not in seen:
+                        seen.add(k)
+                        unique_selectors.append({"tag": s.strip(), "className": ""})
+
+    js_selectors_payload = dumps(unique_selectors, ensure_ascii=False)
+    print(f"[AGENT_DEBUG] 🎯 프론트로 발급할 최종 정제된 셀렉터 페이로드: {js_selectors_payload}")
+
+    js_template = f"""
+    (function() {{
+        'use strict';
+        const originalFetch = window.fetch;
+        const originalXHROpen = XMLHttpRequest.prototype.open;
+        const originalXHRSend = XMLHttpRequest.prototype.send;
+        
+        console.log("[SDK][INIT] '{site.site_name}' 읽기/쓰기 실시간 쉴드 기동 (User: {user_id})");
+        const targetSelectors = {js_selectors_payload};
+        const textCache = new Map();
+
+        // 🧠 네트워크 JSON 바디에서 순수 벨류 텍스트만 추출
+        function extractPureText(input) {{
+            if (!input) return "";
+            let targetStr = typeof input !== 'string' ? JSON.stringify(input) : input;
+            try {{
+                const parsed = JSON.parse(targetStr);
+                if (typeof parsed === 'object' && parsed !== null) {{
+                    if (parsed.frames || parsed.isServer || parsed.isEdgeServer) return ""; 
+                    let textValues = [];
+                    for (let key in parsed) {{
+                        if (typeof parsed[key] === 'string') textValues.push(parsed[key]);
+                    }}
+                    return textValues.join(" ").trim();
+                }}
+            }} catch(e) {{}}
+            return targetStr; 
+        }}
+
+        function hookNetwork() {{
+            window.fetch = async (...args) => {{
+                let [resource, config] = args;
+                if (typeof resource === 'string' && resource.includes('/api/detect')) return originalFetch(...args);
+                
+                const method = config ? (config.method || 'GET').toUpperCase() : 'GET';
+                if (method === 'GET') return originalFetch(...args); // GET 노이즈 스킵
+                
+                const rawContent = (method === 'POST') ? (config.body) : resource;
+                const contentToCheck = extractPureText(rawContent);
+
+                if (!contentToCheck) return originalFetch(...args);
+
+                const result = await detectBadContent(contentToCheck);
+                if (result.isInappropriate) {{ 
+                    alert("🚫 보안 정책에 의해 차단되었습니다: " + result.reason); 
+                    throw new Error("Blocked"); 
+                }}
+                return originalFetch(...args);
+            }};
+
+            XMLHttpRequest.prototype.open = function(method, url) {{
+                this._url = url; 
+                this._method = (method || 'GET').toUpperCase();
+                return originalXHROpen.apply(this, arguments);
+            }};
+            XMLHttpRequest.prototype.send = async function(body) {{
+                if (this._url && this._url.includes('/api/detect')) return originalXHRSend.apply(this, arguments);
+                if (this._method === 'GET') return originalXHRSend.apply(this, arguments);
+                
+                const rawContent = (this._method === 'POST') ? body : this._url;
+                const contentToCheck = extractPureText(rawContent);
+
+                if (!contentToCheck) return originalXHRSend.apply(this, arguments);
+
+                const result = await detectBadContent(contentToCheck);
+                if (result.isInappropriate) {{ 
+                    alert("🚫 보안 정책에 의해 차단되었습니다: " + result.reason); 
+                    this.abort(); return; 
+                }}
+                return originalXHRSend.apply(this, arguments);
+            }};
+        }}
+
+        async function detectBadContent(text) {{
+            if (!text || text.trim() === "") return {{ isInappropriate: false }};
+            const checkText = text.length > 2000 ? text.substring(0, 2000) : text;
+            if (textCache.has(checkText)) return textCache.get(checkText);
+            try {{
+                const response = await originalFetch("http://localhost:8000/api/detect", {{
+                    method: "POST",
+                    headers: {{ "Content-Type": "application/json" }},
+                    body: JSON.stringify({{ text: checkText, user_id: {site.user_id} }})
+                }});
+                const result = await response.json();
+                textCache.set(checkText, result);
+                return result;
+            }} catch (err) {{ return {{ isInappropriate: false }}; }}
+        }}
+
+        function buildQuery(selectorObj) {{
+            if (!selectorObj || !selectorObj.tag) return null;
+            let query = selectorObj.tag;
+            if (selectorObj.className) {{
+                const classes = selectorObj.className.split(' ').filter(c => c).join('.');
+                if (classes) query += `.${{classes}}`;
+            }}
+            return query;
+        }}
+
+        async function filterElement(el) {{
+            if (!el || el.dataset.isFiltered === "true") return;
+            const text = (el.innerText || el.textContent || "").trim();
+            if (!text) return;
+            
+            const result = await detectBadContent(text);
+            if (result.isInappropriate) {{
+                el.dataset.originalHtml = el.innerHTML;
+                el.innerHTML = `<span style="color:#cbd5e0; font-style:italic;">[안전하게 마스킹된 콘텐츠입니다]</span>`;
+            }}
+            el.dataset.isFiltered = "true";
+        }}
+
+        async function checkAndFilter() {{
+            for (const sel of targetSelectors) {{
+                const query = buildQuery(sel);
+                if (!query) continue;
+                try {{
+                    const elements = document.querySelectorAll(query);
+                    for (const el of elements) {{ await filterElement(el); }}
+                }} catch(e) {{}}
+            }}
+        }}
+
+        async function init() {{ hookNetwork(); await checkAndFilter(); }}
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+        const observer = new MutationObserver(() => {{ setTimeout(checkAndFilter, 300); }});
+        observer.observe(document.body, {{ childList: true, subtree: true, characterData: true }});
+    }})();
+    """
+    return Response(content=js_template, media_type="application/javascript")
+
+
+# ==========================================
+# [5] 회원가입, 로그인 및 대시보드 통계 API
+# ==========================================
+
+@app.post("/api/signup")
+async def signup(payload: dict, db: Session = Depends(get_db)):
+    username, password, nickname = payload.get("username"), payload.get("password"), payload.get("nickname")
+    if db.query(models.User).filter(models.User.username == username).first(): return {"success": False, "message": "중복 아이디"}
+    db.add(models.User(username=username, password=password, nickname=nickname))
+    db.commit()
+    return {"success": True}
+
+@app.post("/api/login")
+async def login(request: Request, db: Session = Depends(get_db)):
+    data = await request.json()
+    user = db.query(User).filter(User.username == data.get("username")).first()
+    if not user or user.password != data.get("password"): return {"success": False}
+    return {"success": True, "user_id": user.id, "nickname": user.nickname}
+
+@app.post("/api/setting/update")
+async def update_user_domain_setting(payload: dict, db: Session = Depends(get_db)):
+    user_id, domain, preferences = payload.get("user_id"), payload.get("domain", "").strip(), payload.get("preferences")
+    site = db.query(models.Site).filter(models.Site.user_id == user_id, models.Site.domain.contains(domain)).first()
+    if not site: return {"success": False}
+    setting = db.query(models.UserSetting).filter(models.UserSetting.site_id == site.id).first()
+    if not setting:
+        setting = models.UserSetting(user_id=user_id, site_id=site.id, preferences=preferences)
+        db.add(setting)
+    else: setting.preferences = preferences
+    db.commit()
+    return {"success": True}
+
+@app.get("/api/setting/{user_id}")
+async def get_user_setting(user_id: int, domain: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    query = db.query(UserSetting).filter(UserSetting.user_id == user_id)
+    setting = query.join(Site, UserSetting.site_id == Site.id).filter(Site.domain.contains(domain.strip())).first() if domain else query.order_by(UserSetting.id.desc()).first()
+    if not setting: return {"success": True, "preferences": {"banned_types": [], "is_active": True, "sensitivity": "medium", "custom_keywords": []}}
+    return {"success": True, "preferences": setting.preferences}
+
+@app.get("/api/dashboard/stats/{user_id}")
+async def get_dashboard_statistics(user_id: int, db: Session = Depends(get_db)):
+    total_count = db.query(DetectionLog).filter(DetectionLog.user_id == user_id).count()
+    stage_stats = db.query(DetectionLog.stage, func.count(DetectionLog.id).label("count")).filter(DetectionLog.user_id == user_id).group_by(DetectionLog.stage).all()
+    stage_chart = {row.stage: row.count for row in stage_stats}
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    daily_stats = db.query(func.date(DetectionLog.created_at).label("date"), func.count(DetectionLog.id).label("count")).filter(DetectionLog.user_id == user_id, DetectionLog.created_at >= seven_days_ago).group_by(func.date(DetectionLog.created_at)).all()
+    trend_chart = [{"date": str(row.date), "count": row.count} for row in daily_stats]
+    recent_logs = db.query(DetectionLog).filter(DetectionLog.user_id == user_id).order_by(DetectionLog.created_at.desc()).limit(5).all()
+    recent_list = [{
+        "id": log.id, 
+        "stage": log.stage, 
+        "reason": log.reason, 
+        "blocked_content": log.blocked_content or "내용 없음", 
+        "created_at": log.created_at.strftime("%Y-%m-%d %H:%M:%S")
+    } for log in recent_logs]
+    return {"success": True, "summary": {"total_detected_count": total_count}, "charts": {"stage_distribution": stage_chart, "weekly_trend": trend_chart}, "recent_logs": recent_list}
+
+@app.get("/api/analyze/check")
+async def check_analysis_status(url: str = Query(..., description="대상 URL"), user_id: int = Query(...), db: Session = Depends(get_db)):
+    domain = url.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0].strip()
+    site = db.query(models.Site).filter(models.Site.domain == domain, models.Site.user_id == user_id).first()
+    if not site: return {"success": True, "is_analyzed": False}
+    return {"success": True, "is_analyzed": db.query(models.BoardStructure.id).filter(models.BoardStructure.site_id == site.id).first() is not None}
+
+@app.get("/api/sites/{user_id}")
+async def get_user_registered_sites(user_id: int, db: Session = Depends(get_db)):
+    user_sites = db.query(models.Site).filter(models.Site.user_id == user_id).all()
+    sites_payload = [{"site_id": s.id, "site_name": s.site_name, "domain": s.domain, "created_at": s.created_at.strftime("%Y-%m-%d %H:%M:%S") if s.created_at else None} for s in user_sites]
+    return {"success": True, "sites": sites_payload}
+
+@app.post("/api/detect/bulk")
+async def detect_bulk_proxy(payload: BulkDetectRequest): # 🚀 BackgroundTasks 제거됨
+    target_user_id = payload.user_id
+    final_results = []
+    valid_texts = []
+
+    print(f"\n[DEBUG] 🚀 [Bulk] 익스텐션 대량 검사 요청 수신 | 문장 개수: {len(payload.texts)}개")
+
+    # 1. 빈 텍스트 걸러내고 유효한 텍스트만 모으기
+    for raw_text in payload.texts:
+        cleaned_text = raw_text.strip()
+        if not cleaned_text:
+            continue
+        
+        # 서버 메모리 보호
+        if len(cleaned_text) > 2000:
+            cleaned_text = cleaned_text[:2000]
+            
+        valid_texts.append(raw_text)
+
+    if not valid_texts:
+        return []
+
+    # 2. AI 서버의 Batch API로 딱 한 번만 전송
+    async with httpx.AsyncClient() as client:
+        try:
+            BATCH_API_URL = INFERENCE_ENGINE_URL.rstrip("/") + "/batch"
+            
+            # 눈으로 진짜 주소가 잘 만들어졌는지 확인하기 위한 로그
+            print(f"[DEBUG] 🌐 완성된 Batch 요청 주소: {BATCH_API_URL}")
+            print(f"[DEBUG] 🧠 [AI 전송] {len(valid_texts)}개 문장 Batch API로 일괄 요청 (통신 1회)")
+            
+            response = await client.post(
+                BATCH_API_URL, 
+                json={"texts": valid_texts}, 
+                timeout=30.0 
+            )
+            
+            if response.status_code == 200:
+                batch_results = response.json().get("results", [])
+                
+                # 3. 📥 결과 매핑 (DB 로그 저장 로직 완전 삭제!)
+                for raw_text, ai_result in zip(valid_texts, batch_results):
+                    is_bad = ai_result.get("isInappropriate", False)
+                    
+                    if is_bad:
+                        # 차단되었다는 사실을 터미널 로그로만 남기고, DB에는 저장하지 않습니다.
+                        print(f"[DEBUG] 🛑 [차단됨] '{raw_text[:15]}...' -> {ai_result.get('reason')}")
+                        # ❌ 기존에 있던 background_tasks.add_task(save_detection_log...) 코드 삭제됨
+                    
+                    final_results.append({
+                        "text": raw_text, 
+                        "isInappropriate": is_bad,
+                        "reason": ai_result.get("reason") if is_bad else None
+                    })
+            else:
+                print(f"[DEBUG] ❌ AI 서버 에러 (상태코드: {response.status_code})")
+                for text in valid_texts:
+                    final_results.append({"text": text, "isInappropriate": False})
+                    
+        except Exception as e:
+            print(f"[DEBUG] ❌ 통신 예외 발생: {str(e)}")
+            for text in valid_texts:
+                final_results.append({"text": text, "isInappropriate": False})
+
+    print(f"[DEBUG] ✅ [Bulk] 검사 완료 (로그 미저장) | 총 {len(final_results)}건 반환")
+    return final_results
+
+@app.post("/api/detect/stream")
+async def detect_stream_proxy(payload: BulkDetectRequest):
+    print(f"\n[DEBUG] 🌊 [Stream] 실시간 마이크로 배치 스트리밍 요청 수신 | 문장: {len(payload.texts)}개")
+
+    # 1. 텍스트 전처리 (원본은 유지)
+    valid_texts = []
+    for raw_text in payload.texts:
+        cleaned = raw_text.strip()
+        if cleaned:
+            valid_texts.append(raw_text)
+
+    # 2. 🚀 데이터를 실시간으로 쏴주는 제너레이터 함수
+    async def event_generator():
+        if not valid_texts:
+            return
+
+        chunk_size = 20 # 💡 20개씩 묶어서 AI 서버로 보냅니다.
+        
+        async with httpx.AsyncClient() as client:
+            BATCH_API_URL = INFERENCE_ENGINE_URL.rstrip("/") + "/batch"
+            
+            for i in range(0, len(valid_texts), chunk_size):
+                chunk = valid_texts[i:i + chunk_size]
+                
+                try:
+                    # AI 서버는 기존처럼 Batch로 고속 처리
+                    response = await client.post(BATCH_API_URL, json={"texts": chunk}, timeout=15.0)
+                    
+                    if response.status_code == 200:
+                        batch_results = response.json().get("results", [])
+                        
+                        # 📥 20개의 결과가 나오자마자 브라우저로 1개씩 즉시 발사 (SSE 규격)
+                        for raw_text, ai_result in zip(chunk, batch_results):
+                            is_bad = ai_result.get("isInappropriate", False)
+                            
+                            data_obj = {
+                                "text": raw_text,
+                                "isInappropriate": is_bad,
+                                "reason": ai_result.get("reason") if is_bad else None
+                            }
+                            # "data: {JSON}\n\n" 포맷이 스트리밍(SSE)의 핵심입니다.
+                            yield f"data: {json.dumps(data_obj, ensure_ascii=False)}\n\n"
+                            
+                except Exception as e:
+                    print(f"[DEBUG] ❌ 청크 통신 예외 발생: {str(e)}")
+                    # 에러가 나도 스트리밍이 끊기지 않게 안전 결과 전송
+                    for text in chunk:
+                        data_obj = {"text": text, "isInappropriate": False}
+                        yield f"data: {json.dumps(data_obj, ensure_ascii=False)}\n\n"
+
+    # 3. HTTP 연결을 끊지 않고 계속 데이터를 흘려보냅니다.
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
