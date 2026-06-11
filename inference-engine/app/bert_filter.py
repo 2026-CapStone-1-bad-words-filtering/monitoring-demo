@@ -46,46 +46,50 @@ class BertProfanityFilter:
     
     def evaluate_batch(self, texts: list[str]) -> list[StageResult]:
         """
-        ⚡ 텐서 배치 연산 (Tensor Batching)
-        여러 문장을 한 번에 토큰화하여 단 1회의 모델 연산으로 끝냅니다.
+        ⚡ 텐서 배치 연산 (Tensor Batching) + 초간단 속도 최적화
         """
-        # 1. 배열 통째로 토크나이저에 넣기 (직사각형 행렬 생성)
+        # 1. 🚀 속도 최적화 1: max_length=128 제거 (Dynamic Padding)
+        # 들어온 문장 중 '가장 긴 문장' 길이에 맞춰 행렬 크기가 자동으로 줄어듭니다.
         inputs = self.tokenizer(
             texts, 
             return_tensors="pt", 
             padding=True, 
-            truncation=True, 
-            max_length=128
+            truncation=True
         )
         
-        # 2. 🚀 [수정] 파이토치 전용 디바이스 객체를 사용하여 GPU/CPU로 이동
         inputs = {k: v.to(self.torch_device) for k, v in inputs.items()}
         
-        # 3. 단 한 번의 전진 패스(Forward Pass)
-        outputs = self.model(**inputs)
+        # 2. 🚀 속도 최적화 2: 파이토치 초고속 추론 모드 적용
+        with torch.inference_mode():
+            outputs = self.model(**inputs)
         
-        # 4. 결과 해석 및 확률값 추출
         logits = outputs.logits
         probs = torch.softmax(logits, dim=-1)
         
-        # 비속어 클래스의 확률 (인덱스 1이 '부적절'이라고 가정)
-        # 메모리 누수 방지를 위해 detach() 추가 및 float 캐스팅
-        bad_probs = probs[:, 1].detach().cpu().numpy() 
+        # 3. 🎯 과탐지(False Positive) 해결: 무조건 인덱스 1을 뽑지 않고,
+        # 모델이 가장 확신하는 1등 확률(max_probs)과 그 라벨(predicted_indices)을 찾습니다.
+        max_probs, predicted_indices = torch.max(probs, dim=-1)
+        
+        # CPU 메모리로 가져오기
+        max_probs = max_probs.cpu().numpy()
+        predicted_indices = predicted_indices.cpu().numpy()
         
         batch_results = []
-        for prob in bad_probs:
-            # numpy float를 파이썬 기본 bool, float 타입으로 변환 (Pydantic 스키마 호환)
-            is_bad = bool(prob >= self.threshold)
-            score_val = float(prob)
-            label_str = "부적절" if is_bad else "정상"
+        for prob, idx in zip(max_probs, predicted_indices):
+            # 모델의 설정에서 실제 라벨(LABEL_0, LABEL_1 등)을 꺼내서 한글로 변환
+            raw_label = self.model.config.id2label[idx]
+            label = self.labels.get(raw_label, raw_label)
             
-            # 🚀 [수정] 임시 클래스 대신 정식 StageResult 규격 사용
+            # 1등으로 예측한 라벨이 '부적절'이고, 그 확률이 임계값 이상일 때만 차단!
+            is_bad = bool((label == "부적절") and (prob >= self.threshold))
+            score_val = float(prob)
+            
             res = StageResult(
                 is_inappropriate=is_bad,
-                label=label_str,
+                label=label,
                 score=score_val,
                 reason="2단계(BERT 배치): 악의적 문맥 감지됨." if is_bad else "2단계(BERT 배치): 정상",
-                details={"threshold": self.threshold, "batch_mode": True}
+                details={"threshold": self.threshold, "batch_mode": True, "rawLabel": raw_label}
             )
             batch_results.append(res)
             

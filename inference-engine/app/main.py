@@ -37,6 +37,7 @@ def detect_text(request: DetectRequest):
     print(f"\n[AI_INFERENCE] 📥 실시간 추론 요청 접수 | 데이터 크기: {text_len}자")
     print(f"[AI_INFERENCE] 📝 입력 페이로드 원본 스니펫: '{text_snippet}'")
     
+    
     # 🔥 실제 AI 딥러닝 추론 연산 실행
     try:
         result = pipeline.run(raw_content)

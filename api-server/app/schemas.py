@@ -26,3 +26,4 @@ class UpdateSettingRequest(BaseModel):
 class FilterProxyRequest(BaseModel):
     text: str
     user_id: int
+    threshold: float = 0.85

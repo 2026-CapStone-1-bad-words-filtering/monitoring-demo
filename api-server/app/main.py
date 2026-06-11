@@ -35,10 +35,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class FilterProxyRequest(BaseModel):
+    text: str
+    user_id: int = 1
+    threshold: float = 0.85  # 🚀 추가: 단건 검사 기본값 0.85
+
 class BulkDetectRequest(BaseModel):
     texts: List[str]
     extension_mode: bool = True
     user_id: int = 1
+    threshold: float = 0.85  # 🚀 추가: 대량/스트리밍 검사 기본값 0.85
 
 INFERENCE_ENGINE_URL = "http://inference-engine:8080/detect"
 
@@ -191,6 +197,7 @@ async def detect_proxy(payload: schemas.FilterProxyRequest, background_tasks: Ba
     text = payload.text
     target_user_id = payload.user_id
     print(f"\n[DEBUG] 🚀 필터링 요청 수신 | User ID: {target_user_id} | 수신 데이터: '{text}'")
+    print(f"\n[API_DEBUG] 🎯 단건 검사 | User ID: {payload.user_id} | 수신된 Threshold: {payload.threshold}")
 
     # 🛡️ 백엔드 이중 방어선: 혹시라도 프론트에서 JSON 껍데기가 들어오면 강제로 순수 텍스트만 도려냅니다.
     cleaned_text = text.strip()
@@ -214,7 +221,11 @@ async def detect_proxy(payload: schemas.FilterProxyRequest, background_tasks: Ba
     async with httpx.AsyncClient() as client:
         try:
             # 🚀 타임아웃 15초 유지 (로컬 BERT 연산 대기 보장)
-            response = await client.post(INFERENCE_ENGINE_URL, json={"content": cleaned_text}, timeout=15.0)
+            response = await client.post(
+                INFERENCE_ENGINE_URL, 
+                json={"content": cleaned_text, "threshold": payload.threshold}, 
+                timeout=15.0
+            )
             if response.status_code != 200:
                 return {"isInappropriate": False, "reason": "AI 서버 응답 오류"}
             
@@ -314,45 +325,102 @@ async def get_identifiable_agent(agent_slug: str, db: Session = Depends(get_db))
         const originalXHROpen = XMLHttpRequest.prototype.open;
         const originalXHRSend = XMLHttpRequest.prototype.send;
         
-        console.log("[SDK][INIT] '{site.site_name}' 읽기/쓰기 실시간 쉴드 기동 (User: {user_id})");
-        const targetSelectors = {js_selectors_payload};
+        console.log("[SDK][INIT] '{site.site_name}' Real-time Write/Send Shield Activated (User: {user_id})");
         const textCache = new Map();
 
-        // 🧠 네트워크 JSON 바디에서 순수 벨류 텍스트만 추출
+        function isIgnoreUrl(url) {{
+            if (!url || typeof url !== 'string') return false;
+            if (url.includes('/api/detect')) return true; 
+            const ignores = ['/ping', '/heartbeat', '/telemetry', '/log', 'mock.yamyamee.me']; 
+            return ignores.some(keyword => url.toLowerCase().includes(keyword));
+        }}
+
+        // 🧠 2. 데이터 스나이퍼: 진짜 사람이 쓴 '제목/내용' 텍스트만 추출
         function extractPureText(input) {{
             if (!input) return "";
-            let targetStr = typeof input !== 'string' ? JSON.stringify(input) : input;
+            let textValues = [];
+            let rawStr = typeof input !== 'string' ? JSON.stringify(input) : input;
+
+            // 🚫 삭제, 추천, 단순 조회 등 '글쓰기'가 아닌 시스템 명령은 즉시 무시 (검사 안함)
+            if (rawStr.includes('delete_comment') || rawStr.includes('delete_document') || rawStr.includes('dispBoardDelete')) {{
+                return "";
+            }}
+
+            // 🧹 HTML 태그 제거 헬퍼 (<p>악플</p> -> 악플)
+            function stripHtmlAndSave(html) {{
+                let tmp = document.createElement("DIV");
+                tmp.innerHTML = html;
+                let txt = (tmp.textContent || tmp.innerText || "").trim();
+                if (txt.length > 0) textValues.push(txt);
+            }}
+
+            // 🎯 타겟팅 헬퍼: 사용자가 입력하는 진짜 필드만 쏙 빼오기
+            function processKeyValue(key, value) {{
+                const k = key.toLowerCase();
+                // 제로보드, 라이믹스, 일반 게시판에서 주로 쓰는 본문/제목 키워드
+                if (['title', 'content', 'comment', 'text', 'body', 'editor_sequence'].includes(k)) {{
+                    if (typeof value === 'string') stripHtmlAndSave(value);
+                }}
+            }}
+
             try {{
-                const parsed = JSON.parse(targetStr);
-                if (typeof parsed === 'object' && parsed !== null) {{
-                    if (parsed.frames || parsed.isServer || parsed.isEdgeServer) return ""; 
-                    let textValues = [];
-                    for (let key in parsed) {{
-                        if (typeof parsed[key] === 'string') textValues.push(parsed[key]);
+                // Case 1: 최신 폼 데이터 (FormData, URLSearchParams)
+                if (input instanceof FormData || input instanceof URLSearchParams) {{
+                    for (let [key, value] of input.entries()) processKeyValue(key, value);
+                    return textValues.join(" ");
+                }}
+
+                // Case 2: URL 인코딩 폼 (a=1&b=2) -> 라이믹스/XE에서 주로 사용
+                if (typeof input === 'string' && input.includes('=') && !input.startsWith('{{') && !input.startsWith('<?xml')) {{
+                    const params = new URLSearchParams(input);
+                    for (let [key, value] of params.entries()) processKeyValue(key, value);
+                    if (textValues.length > 0) return textValues.join(" ");
+                }}
+
+                // Case 3: JSON API
+                if (typeof input === 'string' && input.startsWith('{{')) {{
+                    const parsed = JSON.parse(input);
+                    for (let key in parsed) processKeyValue(key, parsed[key]);
+                    if (textValues.length > 0) return textValues.join(" ");
+                }}
+
+                // Case 4: XMLRPC (라이믹스/XE 구형 AJAX 통신 방식)
+                if (typeof input === 'string' && input.includes('<?xml')) {{
+                    // 정규식으로 CDATA(본문) 또는 <string> 태그 안의 텍스트만 강제 추출
+                    let matches = input.match(/<string><\!\[CDATA\[(.*?)\]\]><\/string>/g) || input.match(/<string>(.*?)<\/string>/g);
+                    if (matches) {{
+                        matches.forEach(m => {{
+                            let clean = m.replace(/<string><\!\[CDATA\[/, '').replace(/\]\]><\/string>/, '').replace(/<string>/, '').replace(/<\/string>/, '');
+                            stripHtmlAndSave(clean);
+                        }});
                     }}
-                    return textValues.join(" ").trim();
+                    return textValues.join(" ");
                 }}
             }} catch(e) {{}}
-            return targetStr; 
+
+            // 여기까지 왔는데 일반 문자열인 경우 (단축URL, UUID, 영어로만 된 해시값 등은 버림)
+            if (rawStr.startsWith('http') || rawStr.length < 2 || /^[a-zA-Z0-9_\-]+$/.test(rawStr)) return "";
+
+            return rawStr;
         }}
 
         function hookNetwork() {{
             window.fetch = async (...args) => {{
                 let [resource, config] = args;
-                if (typeof resource === 'string' && resource.includes('/api/detect')) return originalFetch(...args);
+                if (typeof resource === 'string' && isIgnoreUrl(resource)) return originalFetch(...args);
                 
                 const method = config ? (config.method || 'GET').toUpperCase() : 'GET';
-                if (method === 'GET') return originalFetch(...args); // GET 노이즈 스킵
+                if (method === 'GET') return originalFetch(...args);
                 
-                const rawContent = (method === 'POST') ? (config.body) : resource;
+                const rawContent = (method === 'POST' || method === 'PUT') ? (config.body) : resource;
                 const contentToCheck = extractPureText(rawContent);
 
                 if (!contentToCheck) return originalFetch(...args);
 
                 const result = await detectBadContent(contentToCheck);
-                if (result.isInappropriate) {{ 
-                    alert("🚫 보안 정책에 의해 차단되었습니다: " + result.reason); 
-                    throw new Error("Blocked"); 
+                if (result && result.isInappropriate) {{ 
+                    alert("🚫 Transmission blocked by security policy: " + result.reason); 
+                    throw new Error("Blocked by CleanWeb Shield"); 
                 }}
                 return originalFetch(...args);
             }};
@@ -362,18 +430,19 @@ async def get_identifiable_agent(agent_slug: str, db: Session = Depends(get_db))
                 this._method = (method || 'GET').toUpperCase();
                 return originalXHROpen.apply(this, arguments);
             }};
+            
             XMLHttpRequest.prototype.send = async function(body) {{
-                if (this._url && this._url.includes('/api/detect')) return originalXHRSend.apply(this, arguments);
+                if (this._url && isIgnoreUrl(this._url)) return originalXHRSend.apply(this, arguments);
                 if (this._method === 'GET') return originalXHRSend.apply(this, arguments);
                 
-                const rawContent = (this._method === 'POST') ? body : this._url;
+                const rawContent = (this._method === 'POST' || this._method === 'PUT') ? body : this._url;
                 const contentToCheck = extractPureText(rawContent);
 
                 if (!contentToCheck) return originalXHRSend.apply(this, arguments);
 
                 const result = await detectBadContent(contentToCheck);
-                if (result.isInappropriate) {{ 
-                    alert("🚫 보안 정책에 의해 차단되었습니다: " + result.reason); 
+                if (result && result.isInappropriate) {{ 
+                    alert("🚫 Transmission blocked by security policy: " + result.reason); 
                     this.abort(); return; 
                 }}
                 return originalXHRSend.apply(this, arguments);
@@ -385,7 +454,7 @@ async def get_identifiable_agent(agent_slug: str, db: Session = Depends(get_db))
             const checkText = text.length > 2000 ? text.substring(0, 2000) : text;
             if (textCache.has(checkText)) return textCache.get(checkText);
             try {{
-                const response = await originalFetch("http://localhost:8000/api/detect", {{
+                const response = await originalFetch("https://api.yamyamee.me/api/detect", {{
                     method: "POST",
                     headers: {{ "Content-Type": "application/json" }},
                     body: JSON.stringify({{ text: checkText, user_id: {site.user_id} }})
@@ -396,47 +465,21 @@ async def get_identifiable_agent(agent_slug: str, db: Session = Depends(get_db))
             }} catch (err) {{ return {{ isInappropriate: false }}; }}
         }}
 
-        function buildQuery(selectorObj) {{
-            if (!selectorObj || !selectorObj.tag) return null;
-            let query = selectorObj.tag;
-            if (selectorObj.className) {{
-                const classes = selectorObj.className.split(' ').filter(c => c).join('.');
-                if (classes) query += `.${{classes}}`;
-            }}
-            return query;
-        }}
-
-        async function filterElement(el) {{
-            if (!el || el.dataset.isFiltered === "true") return;
-            const text = (el.innerText || el.textContent || "").trim();
-            if (!text) return;
-            
-            const result = await detectBadContent(text);
-            if (result.isInappropriate) {{
-                el.dataset.originalHtml = el.innerHTML;
-                el.innerHTML = `<span style="color:#cbd5e0; font-style:italic;">[안전하게 마스킹된 콘텐츠입니다]</span>`;
-            }}
-            el.dataset.isFiltered = "true";
-        }}
-
-        async function checkAndFilter() {{
-            for (const sel of targetSelectors) {{
-                const query = buildQuery(sel);
-                if (!query) continue;
-                try {{
-                    const elements = document.querySelectorAll(query);
-                    for (const el of elements) {{ await filterElement(el); }}
-                }} catch(e) {{}}
-            }}
-        }}
-
-        async function init() {{ hookNetwork(); await checkAndFilter(); }}
+        function init() {{ hookNetwork(); }}
         if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
-        const observer = new MutationObserver(() => {{ setTimeout(checkAndFilter, 300); }});
-        observer.observe(document.body, {{ childList: true, subtree: true, characterData: true }});
+        
     }})();
     """
-    return Response(content=js_template, media_type="application/javascript")
+    
+    return Response(
+        content=js_template, 
+        media_type="application/javascript",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
 
 
 # ==========================================
@@ -516,6 +559,7 @@ async def detect_bulk_proxy(payload: BulkDetectRequest): # 🚀 BackgroundTasks 
     valid_texts = []
 
     print(f"\n[DEBUG] 🚀 [Bulk] 익스텐션 대량 검사 요청 수신 | 문장 개수: {len(payload.texts)}개")
+    print(f"\n[API_DEBUG] 📦 대량 검사 | 텍스트 {len(payload.texts)}개 | 수신된 Threshold: {payload.threshold}")
 
     # 1. 빈 텍스트 걸러내고 유효한 텍스트만 모으기
     for raw_text in payload.texts:
@@ -543,8 +587,8 @@ async def detect_bulk_proxy(payload: BulkDetectRequest): # 🚀 BackgroundTasks 
             
             response = await client.post(
                 BATCH_API_URL, 
-                json={"texts": valid_texts}, 
-                timeout=30.0 
+                json={"texts": valid_texts, "threshold": payload.threshold}, 
+                timeout=30.0
             )
             
             if response.status_code == 200:
@@ -580,6 +624,7 @@ async def detect_bulk_proxy(payload: BulkDetectRequest): # 🚀 BackgroundTasks 
 @app.post("/api/detect/stream")
 async def detect_stream_proxy(payload: BulkDetectRequest):
     print(f"\n[DEBUG] 🌊 [Stream] 실시간 마이크로 배치 스트리밍 요청 수신 | 문장: {len(payload.texts)}개")
+    print(f"\n[API_DEBUG] 🌊 스트림 검사 | 텍스트 {len(payload.texts)}개 | 수신된 Threshold: {payload.threshold}")
 
     # 1. 텍스트 전처리 (원본은 유지)
     valid_texts = []
@@ -603,7 +648,7 @@ async def detect_stream_proxy(payload: BulkDetectRequest):
                 
                 try:
                     # AI 서버는 기존처럼 Batch로 고속 처리
-                    response = await client.post(BATCH_API_URL, json={"texts": chunk}, timeout=15.0)
+                    response = await client.post(BATCH_API_URL, json={"texts": chunk, "threshold": payload.threshold}, timeout=15.0)
                     
                     if response.status_code == 200:
                         batch_results = response.json().get("results", [])

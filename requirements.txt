@@ -9,3 +9,4 @@ torch
 openai
 torch
 transformers
+optimum[onnxruntime]

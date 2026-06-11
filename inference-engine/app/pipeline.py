@@ -13,7 +13,7 @@ class ModerationPipeline:
         if torch.get_num_threads() > 4:
             torch.set_num_threads(4)
         self.trie_stage = TrieStage()
-        self.bert_stage = BertProfanityFilter(model_dir=model_dir, threshold=0.55) # 변형 비속어 감지용 민감도 튜닝 유지
+        self.bert_stage = BertProfanityFilter(model_dir=model_dir, threshold=0.85) # 변형 비속어 감지용 민감도 튜닝 유지
 
     def run(self, content: str) -> dict:
         content = content.strip()
